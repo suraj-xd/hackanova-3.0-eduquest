@@ -1,0 +1,176 @@
+import { config } from 'dotenv';
+import { GoogleGenerativeAI } from "@google/generative-ai";
+import fs from 'fs';
+import path from 'path';
+import express from 'express';
+import multer from 'multer';
+import cors from 'cors';
+
+// Initialize configuration from .env file
+config();
+console.log(process.env.GEMINI_API_KEY);
+
+// Access your API key as an environment variable
+const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
+
+async function TextInput() {
+  const model = genAI.getGenerativeModel({ model: "gemini-pro"});
+  const prompt = "translate the object values of question, options, answer into hindi";
+  const result = await model.generateContent(prompt);
+  const response = await result.response;
+  const text = await response.text();
+  return text;
+}
+
+function fileToGenerativePart(fileName, mimeType) {
+  const filePath = path.join(process.cwd(), fileName);
+  return {
+    inlineData: {
+      data: Buffer.from(fs.readFileSync(filePath)).toString("base64"),
+      mimeType
+    },
+  };
+}
+
+const app = express();
+const port = process.env.PORT || 3001; // Use environment variable for port if available
+
+const storage = multer.memoryStorage();
+const upload = multer({ storage });
+
+app.use(cors());
+app.use(express.json());
+app.use(express.urlencoded({ extended: true }));
+
+app.post('/upload', upload.single('image'), async (req, res) => {
+  console.log("Request Upload Image");
+  if (!req.file) {
+    return res.status(400).send({ error: 'No image uploaded.', code: 'NO_IMAGE_UPLOADED' });
+  }
+
+  try {
+    const model = genAI.getGenerativeModel({ model: "gemini-pro-vision" });
+    const prompt = "Extract all the Textual content from the provided image";
+    const imagePart = {
+      inlineData: {
+        data: req.file.buffer.toString("base64"),
+        mimeType: req.file.mimetype,
+      },
+    };
+
+    const result = await model.generateContent([prompt, imagePart]);
+    const response = await result.response;
+    const text = await response.text();
+    res.json({ text });
+  } catch (error) {
+    res.status(500).send({ error: 'Error processing image', code: 'PROCESSING_ERROR', details: error.message });
+  }
+});
+
+app.post('/getjson', async (req, res) => {
+  console.log("Request JSON using Prompt");
+
+  if (!req.body.topic) {
+    return res.status(400).send({ error: 'No topic provided.', code: 'NO_TOPIC_PROVIDED' });
+  }
+
+  const model = genAI.getGenerativeModel({ model: "gemini-pro" });
+  const chat = model.startChat({
+    history: [
+      {
+        role: "user",
+        parts: "Hello, I will give you a topic or context around something, and you need to return the json object having, containing 5 mcqs, 5 fill in the blanks, 5 true false, 3 short type, 2 long type around that context MCQs: `question` -> `options` (array), `answer`; Fill in the Blanks: `question` -> `answer`; True/False: `question` -> `answer`; Short Type Question: `question` -> `answer`; Long Type Question: `question` -> `answer`. JSON object keys should strictly needs to be named mcqs,  fill_in_the_blanks, true_false, short_type, long_type",
+      },
+      {
+        role: "model",
+        parts: "Awesome, I'll output a json object having the context provided by you.",
+      },
+    ],
+  });
+  
+  const msg = `The specified topic or context is "${req.body.topic}". Please provide a valid JSON object. Ensure that the JSON is correctly formatted, with proper indentation and no errors.`;
+
+  try {
+    const result = await chat.sendMessage(msg);
+    const response = await result.response;
+    const text = await response.text();
+    
+    let cleanedText = text.replace(/^```(JSON|json)?|```$/g, '').replace(/[*]/g, '');
+    fs.writeFileSync(`${req.body.uuid}.json`, cleanedText);
+    res.json({ success: true, data: cleanedText });
+  } catch (error) {
+    res.status(500).send({ error: 'Error processing request', code: 'PROCESSING_ERROR', details: error.message });
+  }
+});
+
+app.get('/interactive', async (req, res) => {
+  console.log("Request Interactive");
+
+  const filename = `${req.query.query}.json`;
+
+  try {
+    const data = await fs.promises.readFile(filename);
+    res.type('json').send(data);
+  } catch (error) {
+    res.status(500).send({ error: 'File not found or unable to read file', code: 'FILE_READ_ERROR', details: error.message });
+  }
+});
+
+app.post('/analyze', async (req, res) => {
+  console.log("Request Analyze");
+
+  const data = req.body.data;
+  const model = genAI.getGenerativeModel({ model: "gemini-pro" });
+  const chat = model.startChat({
+    history: [
+      {
+        role: "user",
+        parts: "I will supply you with a JSON stringified that includes both 'shortQuestion' and 'longQuestion' sections, each containing a question and its corresponding answer. Please evaluate the responses and score them on a scale of 0 to 100, based on how much you believe the answers do not resemble AI-generated content. The purpose of this exercise is to ensure the authenticity of the answers by confirming they are not generated by artificial intelligence."},
+      {
+        role: "model",
+        parts: "Great! I'll provide detailed feedback on whether answers seems AI-generated, comparing them to actual answers, and combining scores for authenticity and accuracy to ensure comprehensive evaluation.",
+      },
+    ],
+  }); 
+  
+  const msg = `so the data of shortQuestion and longquestion is "${data}". Please provide your the proper feedback under 100 words`;
+  try {
+    const result = await chat.sendMessage(msg);
+    const response = await result.response;
+    const text = await response.text();
+    res.json({ success: true, data: text });
+  } catch (error) {
+    res.status(500).send({ error: 'Error processing request', code: 'PROCESSING_ERROR', details: error.message });
+  }
+});
+
+app.get('/random-question', async (req, res) => {
+  console.log("Request Random Question");
+  try {
+    const files = await fs.promises.readdir('./');
+    const jsonFiles = files.filter(file => file.endsWith('.json'));
+
+    if (jsonFiles.length === 0) {
+      return res.status(404).send({ error: 'No question files found' });
+    }
+
+    const randomFile = jsonFiles[Math.floor(Math.random() * jsonFiles.length)];
+    const data = await fs.promises.readFile(randomFile);
+    const questions = JSON.parse(data);
+
+    const mcqsKey = questions["5 MCQs"] ? "5 MCQs" : "5_mcqs";
+    const randomQuestion = questions[mcqsKey][Math.floor(Math.random() * questions[mcqsKey].length)];
+
+    res.json(randomQuestion);
+  } catch (error) {
+    res.status(500).send({ error: 'Failed to fetch random question', details: error.message });
+  }
+});
+
+app.get('/', (req, res) => {
+  res.send("Success");
+});
+
+app.listen(port, () => {
+  console.log(`Server running at http://localhost:${port}`);
+});
